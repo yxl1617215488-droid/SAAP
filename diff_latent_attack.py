@@ -8,10 +8,6 @@ from utils import view_images, aggregate_attention
 from distances import LpDistance
 import other_attacks
 
-
-# -----------------------
-# （保留）混沌噪声类：保留但默认不使用（仅用于后续对比/实验）
-# -----------------------
 class IndependentChaosNoise:
     def __init__(self, latent_shape, system='logistic'):
         self.latent_shape = latent_shape
@@ -173,11 +169,6 @@ class ChaosPerturbation:
                     shuffled[b, h] = shuffled[b, h][idx_q][:, idx_k]
         perturbation_loss = torch.abs(torch.mean(sim_matrix) - torch.mean(shuffled))
         return shuffled, perturbation_loss
-
-
-# -----------------------
-# Preprocess / encoder / ddim inversion (unchanged)
-# -----------------------
 def preprocess(image, res=512):
     image = image.resize((res, res), resample=Image.LANCZOS)
     image = np.array(image).astype(np.float32) / 255.0
@@ -244,9 +235,6 @@ def ddim_reverse_sample(image, prompt, model, num_inference_steps: int = 20, gui
     return latents, all_latents
 
 
-# -----------------------
-# Attention control registration (modified: accumulate chaos_loss)
-# -----------------------
 def register_attention_control(model, controller, args=None):
     """
     Replace the Attention.forward for UNET to intercept attention matrices.
@@ -315,48 +303,39 @@ def register_attention_control(model, controller, args=None):
 
             sim = torch.einsum("b i d, b j d -> b i j", query, key) * self.scale
 
-            # standard softmax
-            attn = sim.softmax(dim=-1).requires_grad_()  # ✅ 强制保持梯度
-            # 只保留最后一个注意力矩阵用于混沌损失计算，避免内存累积
+            attn = sim.softmax(dim=-1).requires_grad_() 
             controller.last_attn = attn
 
-            # 确保损失变量存在且为 tensor
             if not hasattr(controller, "attention_loss"):
                 controller.attention_loss = torch.tensor(0.0, device=attn.device)
             if not hasattr(controller, "chaos_loss"):
                 controller.chaos_loss = torch.tensor(0.0, device=attn.device)
 
-            # === Chaos regularization loss (entropy + variance + energy_uniformity) ===
             if hasattr(controller, 'attention_chaos_weight') and controller.attention_chaos_weight > 0:
                 seq_len = attn.size(-1)
-                # 计算与均匀分布的KL散度（约束注意力过于集中的问题）
+
                 log_uniform = torch.log(torch.full((seq_len,), 1 / seq_len, device=attn.device))
                 kl_loss = (attn * (torch.log(attn + 1e-8) - log_uniform)).sum(dim=-1).mean()
-                # 再加一个方差正则，鼓励注意力多样性
+
                 var_loss = torch.var(attn, dim=-1).mean()
-                # 增加能量均匀性约束，防止某些位置过度集中
+
                 energy_uniformity = torch.norm(attn - attn.mean(dim=-1, keepdim=True), p=2, dim=-1).mean()
 
-                # 信息熵最大化，促使分布更加均匀
                 entropy = -torch.sum(attn * torch.log(attn + 1e-8), dim=-1).mean()
 
-                # 动态调整混沌权重，随着迭代增加混沌效果
                 dynamic_chaos_weight = controller.attention_chaos_weight
                 if hasattr(controller, 'current_step') and hasattr(controller, 'total_steps'):
-                    # 随着迭代进程逐渐增加混沌权重
+
                     progress = controller.current_step / controller.total_steps
                     dynamic_chaos_weight = controller.attention_chaos_weight * (0.5 + 0.5 * progress)
 
                 controller.chaos_loss = controller.chaos_loss + (
                             kl_loss + var_loss + 0.1 * energy_uniformity - 0.1 * entropy) * dynamic_chaos_weight
 
-            # ---- compute and accumulate "attention" regularizers (no modification to attn) ----
-            # ====== 原有 attention variance 正则 ======
             if hasattr(controller, 'attention_loss_weight') and controller.attention_loss_weight > 0:
-                # 根据参数决定是否在特定blocks中应用注意力损失
-                block_loss_weight = 1.0  # 默认权重
+                block_loss_weight = 1.0  
 
-                if block_loss_weight > 0:  # 只有当权重大于0时才应用损失
+
                     attention_variance = torch.var(attn, dim=-1).mean()
                     controller.attention_loss = controller.attention_loss + attention_variance * controller.attention_loss_weight * block_loss_weight
 
@@ -369,10 +348,10 @@ def register_attention_control(model, controller, args=None):
                 batch_size, seq_len, dim = tensor.shape
                 head_size = self.heads
                 tensor = tensor.reshape(
-                    batch_size // head_size, head_size, seq_len, dim
+                    batch_size 
                 )
                 tensor = tensor.permute(0, 2, 1, 3).reshape(
-                    batch_size // head_size, seq_len, dim * head_size
+                    batch_size
                 )
                 return tensor
 
@@ -474,7 +453,7 @@ def reset_attention_control(model):
                     batch_size // head_size, head_size, seq_len, dim
                 )
                 tensor = tensor.permute(0, 2, 1, 3).reshape(
-                    batch_size // head_size, seq_len, dim * head_size
+                    batch_size 
                 )
                 return tensor
 
@@ -504,10 +483,6 @@ def reset_attention_control(model):
         elif "mid" in net[0]:
             register_recr(net[1])
 
-
-# -----------------------
-# Utils: init_latent / diffusion_step / latent2image
-# -----------------------
 def init_latent(latent, model, height, width, batch_size):
     latents = latent.expand(batch_size, model.unet.in_channels, height // 8, width // 8).to(model.device)
     return latent, latents
@@ -537,12 +512,6 @@ def latent2image(vae, latents):
     image = (image * 255).astype(np.uint8)
     return image
 
-
-# -----------------------
-# Main attack function: diffattack
-# - 新增参数: attention_chaos_weight (控制 chaos 正则项强度)
-# - 不再隐式注入噪声；chaos 通过 controller.chaos_loss 作为损失项参与优化
-# -----------------------
 @torch.enable_grad()
 def diffattack(
         model,
@@ -662,8 +631,6 @@ def diffattack(
 
     uncond_embeddings.requires_grad_(False)
 
-    # register attention hooks that compute regularizers (no in-place noise)
-    # 初始化 controller 的损失项（必须是 tensor 并保持梯度图）
     controller.attention_loss = torch.tensor(0.0, device=model.device, requires_grad=True)
     controller.chaos_loss = torch.tensor(0.0, device=model.device, requires_grad=True)
 
@@ -698,16 +665,13 @@ def diffattack(
     else:
         init_mask = torch.ones([1, 1, *init_image.shape[-2:]]).cuda()
 
-    # keep chaos noise generators available for optional experiments (not used by default)
     chaos_noise_generator = None
 
-    # configure controller-side weights/initial values for regularizers
     controller.attention_loss_weight = attention_loss_weight
     controller.attention_loss = 0.0
     controller.chaos_loss = 0.0
     controller.attention_chaos_weight = attention_chaos_weight
 
-    # 在循环开始前初始化计数器
     controller.current_step = 0
     controller.total_steps = iterations
 
@@ -723,12 +687,10 @@ def diffattack(
         controller.reset()
         latents = torch.cat([original_latent, latent])
 
-        # run forward diffusion sampling (no injected noise by default)
         for ind, t in enumerate(model.scheduler.timesteps[1 + start_step - 1:]):
             # optional: if use_logit_chaos is True, you can produce a chaos noise function to pass to diffusion_step
             latents = diffusion_step(model, latents, context[ind], t, guidance_scale)
 
-        # aggregate attention maps before/after (these functions use the controller hooks)
         before_attention_map = aggregate_attention(prompt, controller, args.res // 32, ("up", "down"), True, 0,
                                                    is_cpu=False)
         after_attention_map = aggregate_attention(prompt, controller, args.res // 32, ("up", "down"), True, 1,
@@ -759,30 +721,24 @@ def diffattack(
         else:
             pred = classifier(out_image)
 
-        # 使用交叉熵损失替代C&W损失
         cross_entro = torch.nn.CrossEntropyLoss()
         attack_loss = - cross_entro(pred, label) * args.attack_loss_weight
 
         self_attn_loss = controller.loss * args.self_attn_loss_weight
 
-        # attention_loss computed in hooks (variance-based if configured)
         attention_loss = getattr(controller, 'attention_loss', 0.0)
 
-        # === Chaos regularization recomputation (keep in main graph) ===
-        # 从 controller 获取最近一次 attention map，用于梯度回传
         if hasattr(controller, 'last_attn'):
-            attn_tensor = controller.last_attn  # 最近一次注意力矩阵
+            attn_tensor = controller.last_attn  
             seq_len = attn_tensor.size(-1)
             log_uniform = torch.log(torch.full((seq_len,), 1 / seq_len, device=attn_tensor.device))
             kl_loss = (attn_tensor * (torch.log(attn_tensor + 1e-8) - log_uniform)).sum(dim=-1).mean()
             var_loss = torch.var(attn_tensor, dim=-1).mean()
             attention_chaos_loss = (kl_loss + var_loss) * attention_chaos_weight
-            # 清理引用以释放内存
             del controller.last_attn
         else:
             attention_chaos_loss = torch.tensor(0.0, device=latent.device)
 
-        # 安全读取损失项（避免属性未定义）
         attention_perturbation_loss = getattr(controller, "attention_loss", torch.tensor(0.0, device=latent.device))
 
         loss = (self_attn_loss + attack_loss +
